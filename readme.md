@@ -7,6 +7,7 @@ Paper: ([arXiv:2407.18559](https://arxiv.org/abs/2407.18559))
 </div>
 
 ## Updates
+* **` June. 26th, 2025`**: This paper is accepted by ICCV2025.
 * **` August. 05th, 2024`**: We release log and ckpt for VSSD with MESA.
 * **` July. 29th, 2024`**: When introduce [MESA](https://arxiv.org/abs/2205.14083) in training as [MLLA](https://github.com/LeapLabTHU/MLLA), VSSD-B achieve 85.4% top-1 acc on ImageNet-1K !
 * **` July. 25th, 2024`**: We release the code, log and ckpt for VSSD.
