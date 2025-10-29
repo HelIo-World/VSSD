@@ -15,15 +15,9 @@ from einops import rearrange, repeat
 import math
 import copy
 try:
-    from linear_attn import PatchMerging,SimplePatchMerging, Stem, SimpleStem, Mlp, RoPE
-    from vis import vis_feature_map, visualize_attention_map
-    from rmt import PatchEmbed as RMTPatchEmbed
-    from rmt import PatchMerging as RMTPatchMerging
+    from mamba_util import PatchMerging,SimplePatchMerging, Stem, SimpleStem, Mlp, RoPE,RMTPatchEmbed,RMTPatchMerging
 except:
-    from .linear_attn import PatchMerging, SimplePatchMerging, Stem, SimpleStem, Mlp, RoPE
-    from .vis import vis_feature_map, visualize_attention_map
-    from .rmt import PatchEmbed as RMTPatchEmbed
-    from .rmt import PatchMerging as RMTPatchMerging
+    from .mamba_util import PatchMerging, SimplePatchMerging, Stem, SimpleStem, Mlp, RoPE, RMTPatchEmbed,RMTPatchMerging
 
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
 from typing import Tuple, Union

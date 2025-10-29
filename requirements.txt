@@ -1,4 +1,4 @@
-torch
+torch==2.1.0
 torchvision
 torchaudio
 packaging
@@ -14,4 +14,4 @@ fvcore
 seaborn
 opencv-python
 tensorboard
-mamba-ssm==2.0.4
+#mamba-ssm==2.0.4

@@ -196,3 +196,91 @@ class SimplePatchMerging(nn.Module):
         x = self.conv(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
         x = self.norm(x)
         return x
+
+class RoPE(torch.nn.Module):
+    r"""Rotary Positional Embedding.
+    """
+    def __init__(self, shape, base=10000):
+        super(RoPE, self).__init__()
+
+        channel_dims, feature_dim = shape[:-1], shape[-1]
+        k_max = feature_dim // (2 * len(channel_dims))
+
+        assert feature_dim % k_max == 0
+
+        # angles
+        theta_ks = 1 / (base ** (torch.arange(k_max) / k_max))
+        angles = torch.cat([t.unsqueeze(-1) * theta_ks for t in torch.meshgrid([torch.arange(d) for d in channel_dims], indexing='ij')], dim=-1)
+
+        # rotation
+        rotations_re = torch.cos(angles).unsqueeze(dim=-1)
+        rotations_im = torch.sin(angles).unsqueeze(dim=-1)
+        rotations = torch.cat([rotations_re, rotations_im], dim=-1)
+        self.register_buffer('rotations', rotations)
+
+    def forward(self, x):
+        x = torch.view_as_complex(x.reshape(*x.shape[:-1], -1, 2))
+        pe_x = torch.view_as_complex(self.rotations) * x
+        return torch.view_as_real(pe_x).flatten(-2)
+
+
+class RMTPatchEmbed(nn.Module):
+    r""" Image to Patch Embedding
+
+    Args:
+        img_size (int): Image size.  Default: 224.
+        patch_size (int): Patch token size. Default: 4.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, in_chans=3, embed_dim=96, norm_layer=None):
+        super().__init__()
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_chans, embed_dim // 2, 3, 2, 1),
+            nn.BatchNorm2d(embed_dim // 2),
+            nn.GELU(),
+            nn.Conv2d(embed_dim // 2, embed_dim // 2, 3, 1, 1),
+            nn.BatchNorm2d(embed_dim // 2),
+            nn.GELU(),
+            nn.Conv2d(embed_dim // 2, embed_dim, 3, 2, 1),
+            nn.BatchNorm2d(embed_dim),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, 3, 1, 1),
+            nn.BatchNorm2d(embed_dim)
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = self.proj(x).permute(0, 2, 3, 1)  # (b h w c)
+        return x
+
+
+class RMTPatchMerging(nn.Module):
+    r""" Patch Merging Layer.
+
+    Args:
+        input_resolution (tuple[int]): Resolution of input feature.
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, dim, out_dim, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.reduction = nn.Conv2d(dim, out_dim, 3, 2, 1)
+        self.norm = nn.BatchNorm2d(out_dim)
+
+    def forward(self, x, H=None, W=None):
+        '''
+        x: B H W C
+        '''
+        x = x.permute(0, 3, 1, 2).contiguous()  # (b c h w)
+        x = self.reduction(x)  # (b oc oh ow)
+        x = self.norm(x)
+        x = x.permute(0, 2, 3, 1)  # (b oh ow oc)
+        return x
