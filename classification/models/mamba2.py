@@ -3,20 +3,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+try:
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+except:
+    print('mamba_ssm not found')
 from einops import rearrange, repeat
 
 import math
 import copy
 try:
-    from mamba_util import PatchMerging,SimplePatchMerging, Stem, SimpleStem, Mlp
+    from linear_attn import PatchMerging,SimplePatchMerging, Stem, SimpleStem, Mlp, RoPE
+    from vis import vis_feature_map, visualize_attention_map
+    from rmt import PatchEmbed as RMTPatchEmbed
+    from rmt import PatchMerging as RMTPatchMerging
 except:
-    from .mamba_util import PatchMerging, SimplePatchMerging, Stem, SimpleStem, Mlp
-from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
+    from .linear_attn import PatchMerging, SimplePatchMerging, Stem, SimpleStem, Mlp, RoPE
+    from .vis import vis_feature_map, visualize_attention_map
+    from .rmt import PatchEmbed as RMTPatchEmbed
+    from .rmt import PatchMerging as RMTPatchMerging
 
+from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
+from typing import Tuple, Union
+# try:
+#     from fla.ops.linear_attn import chunk_linear_attn
+# except:
+#     print('fla not found')
+#check  https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/linear_attn.py
 class tTensor(torch.Tensor):
     @property
     def shape(self):
@@ -26,6 +41,186 @@ class tTensor(torch.Tensor):
 
 to_ttensor = lambda *args: tuple([tTensor(x) for x in args]) if len(args) > 1 else tTensor(args[0])
 
+def rope(x, shape, base=10000):
+    channel_dims, feature_dim = shape[:-1], shape[-1]
+    k_max = feature_dim // (2 * len(channel_dims))
+
+    assert feature_dim % k_max == 0
+
+    # angles
+    theta_ks = 1 / (base ** (torch.arange(k_max, device=x.device) / k_max))
+    angles = torch.cat([t.unsqueeze(-1) * theta_ks for t in torch.meshgrid([torch.arange(d, device=x.device) for d in channel_dims], indexing='ij')], dim=-1)
+
+    # rotation
+    rotations_re = torch.cos(angles).unsqueeze(dim=-1)
+    rotations_im = torch.sin(angles).unsqueeze(dim=-1)
+
+    x = x.reshape(*x.shape[:-1], -1, 2)
+    x_re = x[..., :1]
+    x_im = x[..., 1:]
+    pe_x = torch.cat([x_re * rotations_re - x_im * rotations_im, x_im * rotations_re + x_re * rotations_im], dim=-1)
+    return pe_x.flatten(-2)
+
+
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+
+    Returns:
+        windows: (B, num_windows, window_size*window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().flatten(1,2) # (B, num_windows, window_size, window_size, C)
+    return windows.flatten(2, 3)# (B, num_windows, window_size*window_size, C)
+
+def window_reverse(windows, window_size, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+def decompose_matrix(A, d, niter=2):
+    # Perform SVD
+    U, S, V = torch.svd_lowrank(A, q=d, niter=niter)
+
+    # Truncate U, S, and V to get dimensions N x d and d x N
+    U_d = U[:, :d]
+    S_d = S[:d]
+    V_d = V[:, :d]
+
+    # Construct the two matrices
+    # Matrix 1 (N x d)
+    M1 = U_d * torch.sqrt(S_d)
+    # Matrix 2 (d x N)
+    M2 = (V_d * torch.sqrt(S_d))
+    return M1, M2
+
+def get_sine_svd(pos_embed, svd_dim=128, niter=2):
+    pos_embed = pos_embed.flatten(0,2)
+    pos_sim = pos_embed@pos_embed.T
+    pos_softmax = F.softmax(pos_sim, dim=-1)
+    #pos_softmax = pos_softmax * (pos_softmax > 0.1*pos_softmax.mean())
+    trancated_q, trancated_k = decompose_matrix(pos_softmax, svd_dim, niter)
+    trancated_q, trancated_k = trancated_q.unsqueeze(0), trancated_k.unsqueeze(0) # (1, N, svd_dim), (1, N, svd_dim)
+    return [trancated_q, trancated_k]
+
+class Scale(nn.Module):
+    """
+    Scale vector by element multiplications.
+    """
+    def __init__(self, dim, init_value=1.0, trainable=True):
+        super().__init__()
+        self.scale = nn.Parameter(init_value * torch.ones(dim), requires_grad=trainable)
+
+    def forward(self, x):
+        return x * self.scale
+class RelPos2d(nn.Module):
+    def __init__(self, embed_dim, num_heads, initial_value, heads_range):
+        '''
+        recurrent_chunk_size: (clh clw)
+        num_chunks: (nch ncw)
+        clh * clw == cl
+        nch * ncw == nc
+
+        default: clh==clw, clh != clw is not implemented
+        '''
+        super().__init__()
+        angle = 1.0 / (10000 ** torch.linspace(0, 1, embed_dim // num_heads // 2))
+        angle = angle.unsqueeze(-1).repeat(1, 2).flatten()
+        self.initial_value = initial_value
+        self.heads_range = heads_range
+        self.num_heads = num_heads
+        decay = torch.log(
+            1 - 2 ** (-initial_value - heads_range * torch.arange(num_heads, dtype=torch.float) / num_heads))
+        self.register_buffer('angle', angle)
+        self.register_buffer('decay', decay)
+    def generate_2d_decay(self, H: int, W: int):
+        '''
+        generate 2d decay mask, the result is (HW)*(HW)
+        '''
+        index_h = torch.arange(H).to(self.decay)
+        index_w = torch.arange(W).to(self.decay)
+        grid = torch.meshgrid([index_h, index_w])
+        grid = torch.stack(grid, dim=-1).reshape(H * W, 2)  # (H*W 2)
+        mask = grid[:, None, :] - grid[None, :, :]  # (H*W H*W 2)
+        mask = (mask.abs()).sum(dim=-1)
+        mask = mask * self.decay[:, None, None]  # (n H*W H*W)
+        return mask
+
+    def generate_1d_decay(self, l: int):
+        '''
+        generate 1d decay mask, the result is l*l
+        '''
+        index = torch.arange(l).to(self.decay)
+        mask = index[:, None] - index[None, :]  # (l l)
+        mask = mask.abs()  # (l l)
+        mask = mask * self.decay[:, None, None]  # (n l l)
+        return mask
+
+    def forward(self, slen: Tuple[int], ):
+        '''
+        slen: (h, w)
+        h * w == l
+        '''
+
+        index = torch.arange(slen[0] * slen[1]).to(self.decay)
+        sin = torch.sin(index[:, None] * self.angle[None, :])  # (l d1)
+        sin = sin.reshape(slen[0], slen[1], -1)  # (h w d1)
+        cos = torch.cos(index[:, None] * self.angle[None, :])  # (l d1)
+        cos = cos.reshape(slen[0], slen[1], -1)  # (h w d1)
+        mask = self.generate_2d_decay(slen[0], slen[1])  # (n l l)
+        rel_pos = ((sin, cos), mask)
+        return rel_pos
+
+
+class PositionEmbeddingSine(nn.Module):
+    """
+    #    https://github.com/facebookresearch/detr/blob/main/models/position_encoding.py
+    This is a more standard version of the position embedding, very similar to the one
+    used by the Attention is all you need paper, generalized to work on images.
+    """
+    def __init__(self, num_pos_feats=32, temperature=10000, normalize=True, scale=None):
+        super().__init__()
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.normalize = normalize
+        if scale is not None and normalize is False:
+            raise ValueError("normalize should be True if scale is passed")
+        if scale is None:
+            scale = 2 * math.pi
+        self.scale = scale
+
+    def forward(self, x, h, w):
+        not_mask = torch.ones([x.shape[0], h, w],dtype=torch.bool,device=x.device)
+        y_embed = not_mask.cumsum(1, dtype=torch.float32) # [batch_size, h, w]
+        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        if self.normalize:
+            eps = 1e-6
+            y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
+            x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
+
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device) # [64]
+        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats) # [64]
+
+        pos_x = x_embed[:, :, :, None] / dim_t # [batch_size, h, w, 64]
+        pos_y = y_embed[:, :, :, None] / dim_t
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos = torch.cat((pos_y, pos_x), dim=3)# [batch_size, h, w, 128]
+        return pos
 
 
 class ConvFFN(nn.Module):
@@ -62,8 +257,7 @@ class StandardAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.inner_dim = inner_dim
 
-
-    def forward(self, x, H, W):
+    def forward(self, x, H, W, relpos):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
         dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
@@ -122,11 +316,24 @@ class Mamba2(nn.Module):
         self.chunk_size = chunk_size#torch.tensor(chunk_size,dtype=torch.int32)
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
-        self.ssd_positve_dA = kwargs.get('ssd_positve_dA', True) #default to False, ablation for linear attn duality
-        # Order: [z, x, B, C, dt]
-        d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+        self.partial_win_size = kwargs.get('partial_win_size', -1) #default to -1
+        self.win_only = kwargs.get('win_only', False) #default to False
+        self.ssd_aexp = kwargs.get('ssd_aexp', False) #default to 2
+        self.ssd_positve_dA = kwargs.get('ssd_positve_dA', False) #default to False, ablation for linear attn duality
+        self.ssd_norm_da = kwargs.get('ssd_norm_da', False)
+        self.ssd_linear_norm = kwargs.get('ssd_linear_norm', False)
+        self.win_norm = kwargs.get('win_norm', False)
+        self.zact = kwargs.get('zact', False)
+        self.multi_branch = kwargs.get('multi_branch', True)
+        if self.ssd_linear_norm:
+            self.elu = nn.ELU()
+        if self.multi_branch:
+            # Order: [z, x, B, C, dt]
+            d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+        else:
+            # Order: [x, B, C, dt]
+            d_in_proj = 1 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
         self.in_proj = nn.Linear(self.d_model, int(d_in_proj), bias=bias, **factory_kwargs) #
-
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
 
 
@@ -171,9 +378,11 @@ class Mamba2(nn.Module):
         self.A_log._no_weight_decay = True
 
         # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads, device=device))
-        self.D._no_weight_decay = True
-
+        if kwargs.get('dscale', False):
+            self.D = Scale(dim=self.d_inner, init_value=1.0, trainable=True)
+        else:
+            self.D = nn.Parameter(torch.ones(self.nheads, device=device))
+            self.D._no_weight_decay = True
         # modified from RMSNormGated to layer norm
         #assert RMSNormGated is not None
         #self.norm = RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False, **factory_kwargs)
@@ -182,9 +391,23 @@ class Mamba2(nn.Module):
 
         #linear attention duality
         self.linear_attn_duality = linear_attn_duality
+
+        #lepe positional encoding
+        if kwargs.get('lepe', False):
+            self.lepe = nn.Conv2d(self.d_inner, self.d_inner, 3, padding=1, groups=self.d_inner)
+        else:
+            self.lepe = None
+        if kwargs.get('rope', False):
+            HW = kwargs.get('input_resolution')#FIXME: fix the resolution in dynamic input
+            self.ropes = RoPE(shape=(HW[0], HW[1], self.d_state), base=10000)
+        else:
+            self.ropes = None
+        self.ab_bias = kwargs.get('ab_bias', False)
+        self.decouple_hw = kwargs.get('decouple_hw', False)
         self.kwargs = kwargs
 
-    def non_casual_linear_attn(self, x, dt, A, B, C, D, H=None, W=None):
+
+    def non_casual_linear_attn(self, x, dt, A, B, C, D, H=None, W=None, relpos=None, last_kv=None):
         '''
         non-casual attention duality of mamba v2
         x: (B, L, H, D), equivalent to V in attention
@@ -194,79 +417,110 @@ class Mamba2(nn.Module):
         C: (B, L, d_state), equivalent to Q in attention
         D: (nheads), equivalent to the skip connection
         '''
-
+        skip = x
         batch, seqlen, head, dim = x.shape
         dstate = B.shape[2]
         V = x.permute(0, 2, 1, 3) # (B, H, L, D)
         dt = dt.permute(0, 2, 1) # (B, H, L)
-        dA = dt.unsqueeze(-1) * A.view(1, -1, 1, 1).repeat(batch, 1, seqlen, 1)
+        dA = dt.unsqueeze(-1) * A.view(1, -1, 1, 1)#.repeat(batch, 1, seqlen, 1) # (B, H, L, 1)
+        if self.ssd_aexp: dA = 1/dA.exp()
         if self.ssd_positve_dA: dA = -dA
+        if self.ssd_norm_da: dA = dA / torch.sum(dA, dim=-2, keepdim=True)
 
-        V_scaled = V * dA
         K = B.view(batch, 1, seqlen, dstate)# (B, 1, L, D)
-        if getattr(self, "__DEBUG__", False):
-            A_mat = dA.cpu().detach().numpy()
-            A_mat = A_mat.reshape(batch, -1, H, W)
-            setattr(self, "__data__", dict(
-                dA=A_mat, H=H, W=W, V=V,))
 
-        if self.ngroups == 1:
-            ## get kv via transpose K and V
-            KV = K.transpose(-2, -1) @ V_scaled # (B, H, dstate, D)
-            Q = C.view(batch, 1, seqlen, dstate)#.repeat(1, head, 1, 1)
-            x = Q @ KV # (B, H, L, D)
+
+        Q = C.view(batch, 1, seqlen, dstate)  # (B, 1, L, dstate)
+        if self.ssd_linear_norm:
+            Q, K = self.elu(Q) + 1.0, self.elu(K) + 1.0
+            if self.kwargs.get('exp_da', False):
+                dA = dA.softmax(dim=-2) * seqlen
+            else:
+                dA = dA/dA.max(dim=-2, keepdim=True)[0]
+
+            K, K_plain = K * dA, K
+            Q_pre, K_pre = Q, K
+            if self.ropes is not None:
+                if H!=self.ropes.rotations.shape[0] or W!=self.ropes.rotations.shape[1]:
+                    Q = rope(Q.view(batch, H, W, dstate),(H,W,dstate)).view(batch, -1, dstate).unsqueeze(1)
+                    K = rope(K.flatten(0,1).view(batch*head, H, W, dstate),(H,W,dstate)).view(batch, head, H, W, dstate).flatten(2,3)
+                else:
+                    Q = self.ropes(Q.view(batch, H, W, dstate)).view(batch, -1, dstate).unsqueeze(1) # (B, 1, L, dstate)
+                    K = self.ropes(K.flatten(0,1).view(batch*head, H, W, dstate)).view(batch, head, H, W, dstate).flatten(2,3) # (B, H, L, dstate)
+
+            if getattr(self, "__DEBUG__", False):
+                A_mat = dA.cpu().detach().numpy()
+                A_mat = A_mat.reshape(batch, -1, H, W)
+                setattr(self, "__data__", dict(
+                    dA=A_mat, H=H, W=W, V=V,Q=Q, K=K))
+            Q = Q / (head * dim)#/ (head * dim)  ##  # avoid overlarge scale #(B, 1, L, dstate)
+            Q_pre = Q_pre / (head * dim)#/ (head * dim)  # (Q_nomi * dstate)
+            nomi = (Q_pre @ K_pre.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6) # (B, 1, L, dstate)
+            KV = (K.transpose(-2, -1) * (seqlen ** -0.5)) @ (V * (seqlen ** -0.5)) # (B, H, dstate, D)
+            x = (Q @ KV)
+            x = x / nomi
+
+        else:
+            if self.ropes is not None:
+                Q = self.ropes(Q.view(batch, H, W, dstate)).view(batch, -1, dstate).unsqueeze(1)
+                K = self.ropes(K.view(batch, H, W, dstate)).view(batch, -1, dstate).unsqueeze(1)
+
+            if self.kwargs.get('exp_da', False):
+                dA = dA.softmax(dim=-2)
+                Kscaled = K * dA
+                KV = Kscaled.transpose(-2, -1) @ V
+                x = Q @ KV
+            else:
+                V_scaled = V * dA
+
+                if Q.dtype != V_scaled.dtype or Q.dtype != V_scaled.dtype:
+                    Q, K = Q.to(V_scaled.dtype), K.to(V_scaled.dtype)
+                KV = K.transpose(-2, -1) @ V_scaled # (B, H, dstate, D)
+                x = Q @ KV # (B, H, L, D)
+        if self.kwargs.get('dscale', False):
+            x = x.permute(0, 2, 1, 3).contiguous() + self.D(skip.flatten(2,3)).view(batch, seqlen, head, dim)
+        else:
             x = x + V * D.view(1, -1, 1, 1).repeat(batch, 1, seqlen, 1)
             x = x.permute(0, 2, 1, 3).contiguous()  # (B, L, H, D)
-        else:
-            assert head % self.ngroups == 0
-            dstate = dstate // self.ngroups
-            K = K.view(batch, 1, seqlen, self.ngroups, dstate).permute(0, 1, 3, 2, 4) # (B, 1, g, L, dstate)
-            V_scaled = V_scaled.view(batch, head//self.ngroups, self.ngroups, seqlen, dim) # (B, H//g, g, L, D)
-            Q = C.view(batch, 1, seqlen, self.ngroups, dstate).permute(0, 1, 3, 2, 4) # (B, 1, g, L, dstate)
-
-            KV = K.transpose(-2, -1) @ V_scaled # (B, H//g, g, dstate, D)
-            x = Q @ KV # (B, H//g, g, L, D)
-            V_skip = (V * D.view(1, -1, 1, 1).repeat(batch, 1, seqlen, 1)).view(batch, head//self.ngroups, self.ngroups, seqlen, dim) # (B, H//g, g, L, D)
-            x = x + V_skip # (B, H//g, g, L, D)
-            x = x.permute(0, 3, 1, 2, 4).flatten(2, 3).reshape(batch, seqlen, head, dim) # (B, L, H, D)
-            x = x.contiguous()
-
-        return x
+        return x, KV
 
 
-    def forward(self, u, H, W, seq_idx=None):
+    def forward(self, u, H, W, relpos, seq_idx=None, last_kv = None):
         """
         u: (B,C,H,W)
         Returns: same shape as u
         """
         batch, seqlen, dim = u.shape
-
-        zxbcdt = self.in_proj(u)  # (B, L, d_in_proj)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
         initial_states=repeat(self.init_states, "... -> b ...", b=batch) if self.learnable_init_states else None
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
 
-
-        z, xBC, dt = torch.split(
-            zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
-        )
+        if self.multi_branch:
+            zxbcdt = self.in_proj(u)  # (B, L, d_in_proj)
+            z, xBC, dt = torch.split(
+                zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
+            )
+        else:
+            xbcdt = self.in_proj(u)  # (B, L, d_in_proj)
+            xBC, dt = torch.split(
+                xbcdt, [self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
+            )
         dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
         assert self.activation in ["silu", "swish"]
 
 
-        #2D Convolution
+        # #2D Convolution
         xBC = xBC.view(batch, H, W, -1).permute(0, 3, 1, 2).contiguous()
         xBC = self.act(self.conv2d(xBC))
         xBC = xBC.permute(0, 2, 3, 1).view(batch, H*W, -1).contiguous()
-
         # Split into 3 main branches: X, B, C
         # These correspond to V, K, Q respectively in the SSM/attention duality
         x, B, C = torch.split(xBC, [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
         x, dt, A, B, C = to_ttensor(x, dt, A, B, C)
         if self.linear_attn_duality:
-            y = self.non_casual_linear_attn(
+            y, KV = self.non_casual_linear_attn(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-                dt, A, B, C, self.D, H, W
+                dt, A, B, C, self.D, H, W, relpos, last_kv
             )
         else:
             if self.kwargs.get('bidirection', False):
@@ -304,8 +558,11 @@ class Mamba2(nn.Module):
         # # Multiply "gate" branch and apply extra normalization layer
         # y = self.norm(y, z)
         y = self.norm(y)
-        y = y*z
-        out = self.out_proj(y)
+        if self.multi_branch:
+            if self.zact: z = self.act(z)
+            y = y*z
+        out = self.out_proj(y) # (B, L, D)
+        #if self.kwargs.get('kv_scale', False): return out, KV
         return out
 
 
@@ -326,46 +583,73 @@ class VMAMBA2Block(nn.Module):
 
     def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm, ssd_expansion=2, ssd_ngroups=1, ssd_chunk_size=256,
-                 linear_attn_duality=False, d_state = 64, **kwargs):
+                 linear_attn_duality=False, d_state = 64, first_block = False, **kwargs):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
 
-        self.cpe1 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
         self.norm1 = norm_layer(dim)
-        if kwargs.get('attn_type', 'mamba2') == 'standard':
-            self.attn = StandardAttention(dim=dim, heads=num_heads, dim_head=dim // num_heads, dropout=drop)
-        elif kwargs.get('attn_type', 'mamba2') == 'mamba2':
+        kwargs['input_resolution'] = input_resolution
+        self.attn_type = kwargs.get('attn_type', 'mamba2')
+        if self.attn_type == 'standard':
+            self.attn = StandardAttention(dim=dim, heads=num_heads, dim_head=dim // num_heads, dropout=drop, **kwargs)
+        elif self.attn_type == 'mamba2':
             self.attn = Mamba2(d_model=dim, expand=ssd_expansion, headdim= dim*ssd_expansion // num_heads,
                                 ngroups=ssd_ngroups, chunk_size=ssd_chunk_size,
                                 linear_attn_duality=linear_attn_duality, d_state=d_state, **kwargs)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-        self.cpe2 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        self.use_cpe = kwargs.get('use_cpe', True)
+        if self.use_cpe:
+            self.cpe1 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+            self.cpe2 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+            if kwargs.get('cpe_norm', None) is not None:
+                self.cpe_norm_type = kwargs.get('cpe_norm', None)
+                if self.cpe_norm_type == 'bn':
+                    self.cpe_norm1 = nn.BatchNorm2d(dim)
+                    self.cpe_norm2 = nn.BatchNorm2d(dim)
+            else:
+                self.cpe_norm_type = None
         self.norm2 = norm_layer(dim)
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.use_res_scale = kwargs.get('res_scale', False)
+        #self.kv_scale = kwargs.get('kv_scale', False)
+        if self.use_res_scale:
+            self.layerscale1 = Scale(dim=dim, init_value=1e-6)
+            self.res_scale1 = Scale(dim=dim, init_value=1)
+            self.layerscale2 = Scale(dim=dim, init_value=1e-6)
+            self.res_scale2 = Scale(dim=dim, init_value=1)
 
-    def forward(self, x, H=None, W=None):
+    def forward(self, x, H=None, W=None, relpos=None, last_kv=None):
         B, L, C = x.shape
+        x_init = x
+        kv = None
         if H & W is None:
             H, W = self.input_resolution
             assert L == H * W, "input feature has wrong size"
-
-        x = x + self.cpe1(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
-        shortcut = x
-
-        x = self.norm1(x)
-
         # SSD or Standard Attention
-        x = self.attn(x, H, W)
-        x = shortcut + self.drop_path(x)
-        x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
-
+        if self.use_cpe:
+            if self.cpe_norm_type is not None:
+                x = x + self.cpe_norm1(self.cpe1(x.reshape(B, H, W, C).permute(0, 3, 1, 2))).flatten(2).permute(0, 2, 1)
+            else:
+                x = x + self.cpe1(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+        shortcut = x
+        if self.use_res_scale:
+            x = self.res_scale1(shortcut) + self.layerscale1(self.drop_path(self.attn(self.norm1(x), H, W, relpos)))
+        else:
+            x = shortcut + self.drop_path(self.attn(self.norm1(x), H, W, relpos))
         # FFN
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+        if self.use_cpe:
+            if self.cpe_norm_type is not None:
+                x = x + self.cpe_norm2(self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2))).flatten(2).permute(0, 2, 1)
+            else:
+                x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+        if self.use_res_scale:
+            x = self.res_scale2(x) + self.layerscale2(self.drop_path(self.mlp(self.norm2(x))))
+        else:
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x, kv
 
 
 class BasicLayer(nn.Module):
@@ -401,23 +685,43 @@ class BasicLayer(nn.Module):
                       mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop,
                       drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, norm_layer=norm_layer,
                       ssd_expansion=ssd_expansion, ssd_ngroups=ssd_ngroups, ssd_chunk_size=ssd_chunk_size,
-                      linear_attn_duality=linear_attn_duality, d_state=d_state, **kwargs)
+                      linear_attn_duality=linear_attn_duality, d_state=d_state, first_block=(i==0), **kwargs)
             for i in range(depth)])
 
         # patch merging layer
+        self.rmt_downsample =  kwargs.get('rmt_downsample', False)
         if downsample is not None:
-            self.downsample = downsample(input_resolution, dim=dim)
+            if self.rmt_downsample:
+                self.downsample = downsample(dim, dim*2)
+            else:
+                self.downsample = downsample(input_resolution, dim)
         else:
             self.downsample = None
 
-    def forward(self, x, H=None, W=None):
+        self.trans_svd = kwargs.get('trans_svd', False)
+        if self.trans_svd:
+            self.RelPos = kwargs.get('preset_pos')
+    def forward(self, x, H=None, W=None,):
+        last_kv = None
+        if self.trans_svd:
+            rel_pos = self.RelPos
+            if rel_pos is not None:
+                rel_pos[0] = rel_pos[0].type_as(x)
+                rel_pos[1] = rel_pos[1].type_as(x)
+        else:
+            rel_pos = None
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, H, W)
+                x, last_kv = checkpoint.checkpoint(blk, x, H, W, rel_pos, last_kv=last_kv)
             else:
-                x = blk(x, H, W)
+                x, last_kv  = blk(x, H, W, rel_pos, last_kv=last_kv)
+
         if self.downsample is not None:
+            if self.rmt_downsample:
+                x = x.view(x.shape[0], H, W, -1)
             x = self.downsample(x, H, W)
+            if self.rmt_downsample:
+                x = x.flatten(1, 2)
         return x
 
     def extra_repr(self) -> str:
@@ -428,32 +732,79 @@ class VMAMBA2(nn.Module):
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
                  embed_dim=64, depths=[2, 4, 12, 4], num_heads=[2, 4, 8, 16],
                  mlp_ratio=4., qkv_bias=True, drop_rate=0., drop_path_rate=0.2,
-                 norm_layer=nn.LayerNorm, use_checkpoint=False,
+                 norm_layer=nn.LayerNorm, ape=False, use_checkpoint=False,
                  ssd_expansion=2, ssd_ngroups=1, ssd_chunk_size=256,
-                 linear_attn_duality= True, d_state=64, **kwargs):
+                 linear_attn_duality= False, d_state=64, debug=False, **kwargs):
         super().__init__()
         self.num_classes = num_classes
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
+        self.ape = ape
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.mlp_ratio = mlp_ratio
 
         self.simple_downsample = kwargs.get('simple_downsample', False)
         self.simple_patch_embed = kwargs.get('simple_patch_embed', False)
-        self.attn_types = kwargs.get('attn_types', ['mamba2', 'mamba2', 'mamba2', 'standard'])
+        self.rmt_downsample = kwargs.get('rmt_downsample', False)
+        self.rmt_patch_embed = kwargs.get('rmt_patch_embed', False)
+        self.attn_types = kwargs.get('attn_types', ['mamba2']*len(depths))
+        self.win_only = kwargs.get('win_only', [False]*len(depths))
+        self.use_res_scale = kwargs.get('res_scale', [False]*len(depths))
+        #param for SPT decay
+        self.temp_ranges = kwargs.get('temp_ranges', [1,10,10,1000])
+        self.pos_scale = kwargs.get('pos_scale', [2*math.pi, 2*math.pi, math.pi, math.pi])
+        self.trans_svd = kwargs.get('trans_svd', False)
+        self.spt_dims = kwargs.get('spt_dims', [64]*len(depths))
+        #self.kv_scale = kwargs.get('kv_scale', [False]*len(depths))
+        self.dscale = kwargs.get('dscale', [False]*len(depths))
+        if d_state is not list: d_state = [d_state]*len(depths)
+        if self.mlp_ratio is not list : self.mlp_ratio = [self.mlp_ratio]*len(depths)
+        if kwargs.get('async_state', [None])[0] != None: #FIXME: pass state kwargs via dstate directly
+            d_state = kwargs.get('async_state', [None])
+        if kwargs.get('async_mlp_ratio', [None])[0] != None: #FIXME: pass state kwargs via mlp_ratio directly
+            self.mlp_ratio = kwargs.get('async_mlp_ratio', [None])
         if self.simple_patch_embed:
             self.patch_embed = SimpleStem(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         else:
-            self.patch_embed = Stem(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+            if self.rmt_patch_embed:
+                self.patch_embed = RMTPatchEmbed(in_chans=in_chans, embed_dim=embed_dim)
+            else:
+                self.patch_embed = Stem(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         if self.simple_downsample:
             PatchMergingBlock = SimplePatchMerging
         else:
-            PatchMergingBlock = PatchMerging
-        num_patches = self.patch_embed.num_patches
-        patches_resolution = self.patch_embed.patches_resolution
-        self.patches_resolution = patches_resolution
+            if self.rmt_downsample:
+                PatchMergingBlock = RMTPatchMerging
+            else:
+                PatchMergingBlock = PatchMerging
+        try:
+            patches_resolution = self.patch_embed.patches_resolution
+        except:
+            patches_resolution = [to_2tuple(img_size)[0] // to_2tuple(patch_size)[0], to_2tuple(img_size)[1] // to_2tuple(patch_size)[1]]
+        self.patches_resolution =  patches_resolution
+        self.stage_resolutions = [56, 28, 14, 7] #FIXME: fix the resolution in dynamic input
 
-
+        # absolute position embedding
+        if self.ape:
+            num_patches = self.patch_embed.num_patches
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+            trunc_normal_(self.absolute_pos_embed, std=.02)
+        #svd position embedding
+        if self.trans_svd:
+            svd_emds = []
+            svd_dims = kwargs.get('svd_dims', [256, 128, 64, 32])
+            for i in range(self.num_layers):
+                if svd_dims[i] == -1:
+                    svd_emds.append(None)
+                    continue
+                resolution = self.stage_resolutions[i]
+                PosSine = PositionEmbeddingSine(temperature=self.temp_ranges[i], scale=self.pos_scale[i])
+                pos_sine = PosSine(torch.zeros(1, resolution, resolution), resolution, resolution)
+                tmp_emds = get_sine_svd(pos_sine, svd_dims[i])
+                svd_emds.append(tmp_emds)
+            self.svd_emds = svd_emds
+        else:
+            self.svd_emds = [None] * self.num_layers
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         # stochastic depth
@@ -463,12 +814,16 @@ class VMAMBA2(nn.Module):
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             kwargs['attn_type'] = self.attn_types[i_layer]
+            kwargs['win_only'] = self.win_only[i_layer]
+            kwargs['res_scale'] = self.use_res_scale[i_layer]
+            kwargs['dscale'] = self.dscale[i_layer]
+            kwargs['preset_pos'] = self.svd_emds[i_layer]
             layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
                                input_resolution=(patches_resolution[0] // (2 ** i_layer),
                                                  patches_resolution[1] // (2 ** i_layer)),
                                depth=depths[i_layer],
                                num_heads=num_heads[i_layer],
-                               mlp_ratio=self.mlp_ratio,
+                               mlp_ratio=self.mlp_ratio[i_layer],
                                qkv_bias=qkv_bias, drop=drop_rate,
                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                                norm_layer=norm_layer,
@@ -478,7 +833,7 @@ class VMAMBA2(nn.Module):
                                ssd_ngroups=ssd_ngroups,
                                ssd_chunk_size=ssd_chunk_size,
                                linear_attn_duality = linear_attn_duality,
-                               d_state = d_state,
+                               d_state = d_state[i_layer],
                                **kwargs)
             self.layers.append(layer)
 
@@ -488,6 +843,7 @@ class VMAMBA2(nn.Module):
 
         self.apply(self._init_weights)
 
+        self.debug = debug
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -519,25 +875,44 @@ class VMAMBA2(nn.Module):
         try:
             Gflops, unsupported = flop_count(model=model, inputs=(input,), supported_ops=supported_ops)
         except Exception as e:
+            #print full error message
             print('get exception', e)
-            print('Error in flop_count, set to default value 1e9')
-            return 1e9
+            print('Error in flop_count, set to default value 1e6')
+            return 1e6
         del model, input
-
+        #manually check flops for non-casual linear attention
+        linear_attn_flops = 0
+        for i_layer, layer in enumerate(self.layers):
+            if self.attn_types[i_layer] == 'mamba2':
+                seq_len = layer.input_resolution[0] * layer.input_resolution[1]
+                tmp_flops = len(layer.blocks) * 2 * layer.blocks[0].attn.d_inner * layer.blocks[0].attn.d_state * seq_len
+                linear_attn_flops +=  tmp_flops
+            elif self.attn_types[i_layer] == 'standard':
+                seq_len = layer.input_resolution[0] * layer.input_resolution[1]
+                tmp_flops = len(layer.blocks) * 2 * layer.blocks[0].attn.inner_dim * seq_len * seq_len
+                linear_attn_flops +=  tmp_flops
+        print(f"non_casual_linear_attn_flop: {linear_attn_flops/1e9} G")
         return sum(Gflops.values()) * 1e9
 
     def forward_features(self, x):
         H, W = x.shape[-2:]
         x = self.patch_embed(x)
+        if self.rmt_patch_embed:
+            x = x.flatten(1,2)
         H, W = H//4, W//4 # downsampled by patch_embed
 
+        if self.ape:
+            x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
         for layer in self.layers:
             x = layer(x, H, W)
-            H, W = H//2, W//2 # downsampled by layer
-
+            if layer != self.layers[-1]:
+                H, W = H//2, W//2 # downsampled by layer
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
+        if self.debug:
+            x = x.view(x.size(0), x.size(1), H, W)
+            return x
         x = torch.flatten(x, 1)
         return x
 
@@ -561,7 +936,9 @@ class Backbone_VMAMBA2(VMAMBA2):
         del self.head
         del self.norm
         del self.avgpool
-        self.load_pretrained(pretrained,key=kwargs.get('key','model'))
+        self.load_pretrained(pretrained,key=kwargs.get('key','model_ema')) #FIXME load model by default
+        self.rmt_downsample = kwargs.get('rmt_downsample', False)
+        self.rmt_patch_embed = kwargs.get('rmt_patch_embed', False)
 
     def load_pretrained(self, ckpt=None, key="model"):
         if ckpt is None:
@@ -580,15 +957,25 @@ class Backbone_VMAMBA2(VMAMBA2):
 
         def layer_forward(l, x, H=None, W=None):
             for blk in l.blocks:
-                x = blk(x, H, W)
+                x,_ = blk(x, H, W)
             if l.downsample is not None:
-                y = l.downsample(x, H, W)
+                #y = l.downsample(x, H, W)
+                if self.rmt_downsample:
+                    y = x.view(x.shape[0], H, W, -1)
+                else:
+                    y = x
+                y = l.downsample(y, H, W)
+                if self.rmt_downsample:
+                    y = y.flatten(1, 2)
             else:
                 y = x
             return x, y
 
         H, W = x.shape[-2:]
         x = self.patch_embed(x)
+        if self.rmt_patch_embed:
+            x = x.flatten(1,2)
+
         if self.simple_patch_embed:
             H, W = H//4, W//4
         else:

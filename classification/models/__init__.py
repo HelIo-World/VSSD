@@ -18,17 +18,50 @@ def build_vssd_model(config, is_pretrain=False):
             mlp_ratio=config.MODEL.VMAMBA2.MLP_RATIO,
             drop_rate=config.MODEL.VMAMBA2.DROP_RATE,
             drop_path_rate=config.MODEL.VMAMBA2.DROP_PATH_RATE,
+            ape=config.MODEL.VMAMBA2.APE,
             simple_downsample=config.MODEL.VMAMBA2.SIMPLE_DOWNSAMPLE,
             simple_patch_embed=config.MODEL.VMAMBA2.SIMPLE_PATCH_EMBED,
             ssd_expansion=config.MODEL.VMAMBA2.SSD_EXPANSION,
             ssd_ngroups=config.MODEL.VMAMBA2.SSD_NGROUPS,
             ssd_chunk_size=config.MODEL.VMAMBA2.SSD_CHUNK_SIZE,
-            linear_attn_duality = config.MODEL.VMAMBA2.LINEAR_ATTN_DUALITY,
+            linear_attn_duality=config.MODEL.VMAMBA2.LINEAR_ATTN_DUALITY,
             lepe=config.MODEL.VMAMBA2.LEPE,
             attn_types=config.MODEL.VMAMBA2.ATTN_TYPES,
             bidirection=config.MODEL.VMAMBA2.BIDIRECTION,
             d_state=config.MODEL.VMAMBA2.D_STATE,
-            ssd_positve_dA = config.MODEL.VMAMBA2.SSD_POSITIVE_DA,
+            partial_win_size=config.MODEL.VMAMBA2.PARTIAL_WIN_SIZE,
+            ssd_aexp=config.MODEL.VMAMBA2.SSD_AEXP,
+            ssd_positve_dA=config.MODEL.VMAMBA2.SSD_POSITIVE_DA,
+            win_only=config.MODEL.VMAMBA2.WIN_ONLY,
+            res_scale=config.MODEL.VMAMBA2.RES_SCALE,
+            ssd_norm_da=config.MODEL.VMAMBA2.SSD_NORM_DA,
+            zact=config.MODEL.VMAMBA2.ZACT,
+            rope=config.MODEL.VMAMBA2.ROPE,
+            ssd_linear_norm=config.MODEL.VMAMBA2.SSD_LINEAR_NORM,
+            win_norm=config.MODEL.VMAMBA2.WIN_NORM,
+            async_state=config.MODEL.VMAMBA2.ASYNC_STATE,
+            ab_bias=config.MODEL.VMAMBA2.AB_BIAS,
+            rmt_downsample=config.MODEL.VMAMBA2.RMT_DOWNSAMPLE,
+            rmt_patch_embed=config.MODEL.VMAMBA2.RMT_PATCH_EMBED,
+            multi_branch=config.MODEL.VMAMBA2.MULTI_BRANCH,
+            use_cpe=config.MODEL.VMAMBA2.USE_CPE,
+            decouple_hw=config.MODEL.VMAMBA2.DECOUPLE_HW,
+            spt_decay=config.MODEL.VMAMBA2.SPT_DECAY,
+            temp_ranges=config.MODEL.VMAMBA2.TEMP_RANGES,
+            pos_scale=config.MODEL.VMAMBA2.POS_SCALE,
+            trans_svd=config.MODEL.VMAMBA2.TRANS_SVD,
+            spt_learn=config.MODEL.VMAMBA2.SPT_LEARN,
+            svd_dims=config.MODEL.VMAMBA2.SVD_DIMS,
+            scale_pos=config.MODEL.VMAMBA2.SCALE_POS,
+            svd_norm=config.MODEL.VMAMBA2.SVD_NORM,
+            exp_da=config.MODEL.VMAMBA2.EXP_DA,
+            pos_fuse_type=config.MODEL.VMAMBA2.POS_FUSE_TYPE,
+            temp_range_head=config.MODEL.VMAMBA2.TEMP_RANGE_HEAD,
+            kv_scale=config.MODEL.VMAMBA2.KV_SCALE,
+            async_mlp_ratio=config.MODEL.VMAMBA2.ASYNC_MLP_RATIO,
+            dscale=config.MODEL.VMAMBA2.DSCALE,
+            attn_drop=config.MODEL.VMAMBA2.ATTN_DROP,
+            cpe_norm=config.MODEL.VMAMBA2.CPE_NORM,
         )
         return model
     return None
@@ -42,8 +75,8 @@ def build_mmpretrain_models(cfg="swin_tiny", ckpt=True, only_backbone=False, wit
     from mmengine.runner import CheckpointLoader
     from mmpretrain.models import build_classifier, ImageClassifier, ConvNeXt, VisionTransformer, SwinTransformer
     from mmengine.config import Config
-    config_root = os.path.join(os.path.dirname(__file__), "../../analyze/mmpretrain_configs/configs/") 
-    
+    config_root = os.path.join(os.path.dirname(__file__), "../../analyze/mmpretrain_configs/configs/")
+
     CFGS = dict(
         swin_tiny=dict(
             model=Config.fromfile(os.path.join(config_root, "./swin_transformer/swin-tiny_16xb64_in1k.py")).to_dict()['model'], 
@@ -54,11 +87,11 @@ def build_mmpretrain_models(cfg="swin_tiny", ckpt=True, only_backbone=False, wit
             ckpt="https://download.openmmlab.com/mmclassification/v0/convnext/convnext-tiny_32xb128_in1k_20221207-998cf3e9.pth",
         ),
         deit_small=dict(
-            model=Config.fromfile(os.path.join(config_root, "./deit/deit-small_4xb256_in1k.py")).to_dict()['model'], 
+            model=Config.fromfile(os.path.join(config_root, "./deit/deit-small_4xb256_in1k.py")).to_dict()['model'],
             ckpt="https://download.openmmlab.com/mmclassification/v0/deit/deit-small_pt-4xb256_in1k_20220218-9425b9bb.pth",
         ),
         resnet50=dict(
-            model=Config.fromfile(os.path.join(config_root, "./resnet/resnet50_8xb32_in1k.py")).to_dict()['model'], 
+            model=Config.fromfile(os.path.join(config_root, "./resnet/resnet50_8xb32_in1k.py")).to_dict()['model'],
             ckpt="https://download.openmmlab.com/mmclassification/v0/resnet/resnet50_8xb32_in1k_20210831-ea4938fc.pth",
         ),
         # ================================
@@ -71,11 +104,11 @@ def build_mmpretrain_models(cfg="swin_tiny", ckpt=True, only_backbone=False, wit
             ckpt="https://download.openmmlab.com/mmclassification/v0/convnext/convnext-small_32xb128_in1k_20221207-4ab7052c.pth",
         ),
         deit_base=dict(
-            model=Config.fromfile(os.path.join(config_root, "./deit/deit-base_16xb64_in1k.py")).to_dict()['model'], 
+            model=Config.fromfile(os.path.join(config_root, "./deit/deit-base_16xb64_in1k.py")).to_dict()['model'],
             ckpt="https://download.openmmlab.com/mmclassification/v0/deit/deit-base_pt-16xb64_in1k_20220216-db63c16c.pth",
         ),
         resnet101=dict(
-            model=Config.fromfile(os.path.join(config_root, "./resnet/resnet101_8xb32_in1k.py")).to_dict()['model'], 
+            model=Config.fromfile(os.path.join(config_root, "./resnet/resnet101_8xb32_in1k.py")).to_dict()['model'],
             ckpt="https://download.openmmlab.com/mmclassification/v0/resnet/resnet101_8xb32_in1k_20210831-539c63f8.pth",
         ),
         # ================================
@@ -110,6 +143,7 @@ def build_mmpretrain_models(cfg="swin_tiny", ckpt=True, only_backbone=False, wit
         def forward_backbone(self: ImageClassifier, x):
             x = self.backbone(x)[-1]
             return x
+
         if not with_norm:
             setattr(model, f"norm{model.backbone.out_indices[-1]}", lambda x: x)
         model.forward = partial(forward_backbone, model)
@@ -119,7 +153,7 @@ def build_mmpretrain_models(cfg="swin_tiny", ckpt=True, only_backbone=False, wit
 
 def build_model(config, is_pretrain=False):
     model = None
-    
+
     if model is None:
         model = build_vssd_model(config, is_pretrain)
     return model

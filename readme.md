@@ -7,6 +7,7 @@ Paper: ([arXiv:2407.18559](https://arxiv.org/abs/2407.18559))
 </div>
 
 ## Updates
+* **` Oct. 29th, 2025`**: We update code for ICCV2025 camera-ready version.
 * **` June. 26th, 2025`**: This paper is accepted by ICCV2025.
 * **` August. 05th, 2024`**: We release log and ckpt for VSSD with MESA.
 * **` July. 29th, 2024`**: When introduce [MESA](https://arxiv.org/abs/2205.14083) in training as [MLLA](https://github.com/LeapLabTHU/MLLA), VSSD-B achieve 85.4% top-1 acc on ImageNet-1K !
@@ -25,6 +26,18 @@ For more information, please refer to our [paper](https://arxiv.org/abs/2407.185
 </p>
 
 ## Main Results
+
+### **Classification on ImageNet-1K (ICCV2025 Version)**
+
+|    name    | pretrain | resolution |  acc@1   | #params | FLOPs | logs |                                          ckpts                                           |
+|:----------:| :---: | :---: |:--------:|:-------:|:-----:|:----:|:----------------------------------------------------------------------------------------:|
+| VSSD-Tiny  | ImageNet-1K | 224x224 |   83.8   |   28M   | 5.0G  |  -   |        [ckpt](https://huggingface.co/YuhengSSS/VSSD_ICCV_weights/blob/main/vssd_tiny_mesa.pth)        |
+| VSSD-Small | ImageNet-1K | 224x224 |   84.6   |   50M   | 8.1G  |  -   | [ckpt](https://huggingface.co/YuhengSSS/VSSD_ICCV_weights/blob/main/vssd_small_mesa.pth) |
+| VSSD-Base  | ImageNet-1K | 224x224 | **85.4** |   89M   | 16.1G |  -   |      [ckpt](https://huggingface.co/YuhengSSS/VSSD_ICCV_weights/blob/main/vssd_base_e300_with_mesa.pth)      |
+
+We add several tricks including ASYNC_STATE, 2D RoPE Embedding and Normalization in the NC-SSD block to further improve the performance. Check the config with suffix `_iccv2025` and source code for details.
+
+For weights of downstream tasks, please contact me if needed.
 
 ### **Classification on ImageNet-1K**
 
